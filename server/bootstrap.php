@@ -1,0 +1,16 @@
+<?php
+declare(strict_types=1);
+date_default_timezone_set('Asia/Damascus');
+$envFile = dirname(__DIR__) . '/.env';
+if (is_file($envFile)) { foreach (file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) { if (str_starts_with(trim($line), '#') || !str_contains($line, '=')) continue; [$k,$v]=explode('=',$line,2); if (getenv(trim($k))===false) putenv(trim($k).'='.trim($v," \t\"'")); } }
+function fail(int $status,string $message): never { http_response_code($status); header('Content-Type: application/json; charset=utf-8'); echo json_encode(['error'=>$message],JSON_UNESCAPED_UNICODE); exit; }
+function respond(mixed $data,int $status=200): never { http_response_code($status); header('Content-Type: application/json; charset=utf-8'); echo json_encode($data,JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR); exit; }
+function db(): PDO { static $db; if ($db) return $db; $path=getenv('DB_PATH') ?: __DIR__.'/storage/app.sqlite'; if (!is_dir(dirname($path))) mkdir(dirname($path),0700,true); $db=new PDO('sqlite:'.$path,null,null,[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC]); $db->exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;'); return $db; }
+function query(string $sql,array $args=[]): PDOStatement { $s=db()->prepare($sql); $s->execute($args); return $s; }
+function body(): array { if ((int)($_SERVER['CONTENT_LENGTH']??0)>1048576) fail(413,'الطلب كبير جدًا'); try {$v=json_decode(file_get_contents('php://input'),true,32,JSON_THROW_ON_ERROR);} catch (JsonException) {fail(400,'بيانات JSON غير صالحة');} if(!is_array($v)||array_is_list($v)) fail(422,'يجب إرسال كائن بيانات'); return $v; }
+function text(array $v,string $key,int $max=255,bool $required=false): string { $s=$v[$key]??''; if(!is_string($s)) fail(422,'قيمة غير صالحة: '.$key); $s=trim($s); if(mb_strlen($s)>$max||($required&&$s==='')) fail(422,'تحقق من الحقل: '.$key); return $s; }
+function phone(string $s,bool $required=false): string { $s=strtr($s,['٠'=>'0','١'=>'1','٢'=>'2','٣'=>'3','٤'=>'4','٥'=>'5','٦'=>'6','٧'=>'7','٨'=>'8','٩'=>'9']); $s=preg_replace('/[\s()-]/u','',$s); if(str_starts_with($s,'00')) $s='+'.substr($s,2); if(preg_match('/^09[0-9]{8}$/D',$s)) $s='+963'.substr($s,1); if($s===''&&!$required) return ''; if(!preg_match('/^\+[1-9][0-9]{7,14}$/D',$s)) fail(422,'أدخل رقم الهاتف مع رمز البلد'); return $s; }
+function now(): string { return gmdate('c'); }
+function audit(string $action,?int $entity=null): void { query('INSERT INTO audit_log(actor_id,action,entity_id,created_at) VALUES(?,?,?,?)',[$_SESSION['uid']??null,$action,$entity,now()]); }
+function rateLimit(string $bucket,int $limit=20,int $seconds=900): void { $key=hash('sha256',$bucket); $time=time(); query('INSERT INTO rate_limits(bucket,hits,expires) VALUES(?,1,?) ON CONFLICT(bucket) DO UPDATE SET hits=CASE WHEN expires < ? THEN 1 ELSE hits+1 END, expires=CASE WHEN expires < ? THEN excluded.expires ELSE expires END',[$key,$time+$seconds,$time,$time]); $row=query('SELECT hits FROM rate_limits WHERE bucket=?',[$key])->fetch(); if((int)$row['hits']>$limit) {header('Retry-After: '.$seconds); fail(429,'محاولات كثيرة، حاول لاحقًا');} }
+set_exception_handler(function(Throwable $e): never { error_log((string)$e); fail(500,'تعذر إتمام العملية. حاول مجددًا'); });
