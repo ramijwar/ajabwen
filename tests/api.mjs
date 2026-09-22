@@ -1,0 +1,46 @@
+import assert from 'node:assert/strict';
+import { spawn,execFileSync } from 'node:child_process';
+import { mkdtempSync,rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+const dir=mkdtempSync(join(tmpdir(),'ajabwen-test-'));
+const env={...process.env,APP_ENV:'development',DB_PATH:join(dir,'test.sqlite'),ADMIN_PHONE:'+963900000000',ADMIN_NAME:'مدير اختبار مؤقت',ADMIN_PASSWORD:randomBytes(24).toString('hex')};
+let server;let logs='';
+function client(){let cookie='',csrf='';return async(path,method='GET',body,expected=200,withCsrf=true)=>{const response=await fetch(`http://127.0.0.1:18763/api${path}`,{method,headers:{...(cookie?{Cookie:cookie}:{}),...(withCsrf?{'X-CSRF-Token':csrf}:{}),...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined});const set=response.headers.get('set-cookie');if(set)cookie=set.split(';')[0];const data=await response.json();assert.equal(response.status,expected,`${method} ${path}: ${JSON.stringify(data)}`);if(data.csrf)csrf=data.csrf;return data;};}
+try{
+ execFileSync('php',['server/console.php','init'],{env,stdio:'pipe'});execFileSync('php',['server/console.php','admin'],{env,stdio:'pipe'});
+ server=spawn('php',['-S','127.0.0.1:18763','-t','server/public','server/public/index.php'],{env,stdio:['ignore','pipe','pipe']});server.stderr.on('data',d=>logs+=d);server.stdout.on('data',d=>logs+=d);
+ let ready=false;for(let i=0;i<60;i++){try{const r=await fetch('http://127.0.0.1:18763/api/health');if(r.ok){ready=true;break;}}catch{}await new Promise(r=>setTimeout(r,100));}assert.ok(ready,'PHP test server must start');
+ const admin=client(),owner=client(),other=client(),publicUser=client();
+ await admin('/session');await admin('/login','POST',{phone:env.ADMIN_PHONE,password:env.ADMIN_PASSWORD});
+ await owner('/session');const registered=await owner('/register','POST',{phone:'+963900000001',password:'test-only-password-123',full_name:'مالك اختبار مؤقت'});assert.equal(registered.user.role,'user');
+ await other('/session');await other('/register','POST',{phone:'+963900000002',password:'test-only-password-456',full_name:'مستخدم اختبار آخر',role:'admin'});await other('/admin/users','GET',undefined,403);
+ await publicUser('/session');await publicUser('/my/services','GET',undefined,401);
+ await owner('/profile','PATCH',{full_name:'مالك اختبار مؤقت'},419,false);
+ await owner('/profile','PATCH',{full_name:'مالك اختبار مؤقت',birth_date:'2099-01-01'},422);
+ const area=(await admin('/admin/areas','POST',{name:'منطقة اختبار مؤقتة',scope:'city'})).id;
+ const payload={name:'صيدلية اختبار غير حقيقية',category_id:1,area_id:area,address:'عنوان اختبار فقط',phone:'+963900000003',whatsapp:'',description:'',details:{},schedule:[{day:1,start:'22:00',end:'02:00'}]};
+ const created=(await owner('/services','POST',payload,201)).service;assert.equal(created.approval,'pending');assert.equal((await publicUser('/services')).total,0);
+ await other(`/services/${created.id}`,'PATCH',payload,403);await owner(`/services/${created.id}/availability`,'PATCH',{status:'open',hours:1,on_duty:false},409);
+ await owner(`/admin/services/${created.id}/review`,'POST',{approval:'approved'},403);
+ await admin(`/admin/services/${created.id}/review`,'POST',{approval:'approved'});
+ assert.equal((await publicUser('/services')).total,1);
+ const published=(await publicUser(`/services/${created.id}`)).service;assert.ok(!('owner_id'in published));assert.ok(!('birth_date'in published));
+ await owner(`/services/${created.id}`,'PATCH',{...payload,schedule:[{day:1,start:'09:00',end:'17:00'}]});assert.equal((await publicUser('/services')).total,1,'schedule-only edit stays approved');
+ await owner(`/services/${created.id}`,'PATCH',{...payload,schedule:[{day:1,start:'09:00',end:'09:00'}]},422);
+ const opened=(await owner(`/services/${created.id}/availability`,'PATCH',{status:'open',hours:1,on_duty:true})).service;assert.equal(opened.status,'open');assert.equal(opened.on_duty,true);
+ assert.equal((await publicUser('/services?status=duty')).total,1);
+ await owner(`/services/${created.id}/availability`,'PATCH',{status:'open',hours:999,on_duty:false},422);
+ await other(`/services/${created.id}/availability`,'PATCH',{status:'closed',hours:1,on_duty:false},403);
+ await owner(`/services/${created.id}`,'PATCH',{...payload,name:'تعديل يحتاج مراجعة'});assert.equal((await publicUser('/services')).total,0,'identity edit returns to moderation');
+ await admin(`/services/${created.id}`,'PATCH',{...payload,owner_id:registered.user.id});await admin(`/admin/services/${created.id}/review`,'POST',{approval:'approved'});
+ await admin(`/admin/areas/${area}`,'DELETE',undefined,409);await owner(`/services/${created.id}`,'DELETE',undefined,403);
+ const category=(await admin('/admin/categories','POST',{name:'خدمة اختبار',slug:'test-service',icon:'wrench',color:'#123456',layout:'list',kind:'general',supports_duty:false,sort_order:8})).id;
+ const generic=(await admin('/services','POST',{...payload,category_id:category,owner_id:registered.user.id},201)).service;
+ await owner(`/services/${generic.id}/availability`,'PATCH',{status:'open',hours:1,on_duty:true},422);
+ await admin(`/services/${generic.id}`,'DELETE');await admin(`/admin/categories/${category}`,'DELETE');
+ await admin(`/services/${created.id}`,'DELETE');await publicUser(`/services/${created.id}`,'GET',undefined,404);await admin(`/admin/areas/${area}`,'DELETE');
+ await owner('/logout','POST',{});await owner('/my/services','GET',undefined,401);
+ console.log('PASS: isolated SQLite API integration, registration, CSRF, ownership, review, schedules, availability, filters and deletion');
+}catch(e){console.error(logs);throw e;}finally{if(server){server.kill('SIGTERM');await new Promise(r=>server.once('exit',r));}rmSync(dir,{recursive:true,force:true});}
